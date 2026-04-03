@@ -2860,28 +2860,6 @@ function bumpReqCounter(type) {
   try { localStorage.setItem('dalal_req_counter_' + type, String(m.requests[type])); } catch(e) {}
 }
 
-function markSourceSuccess(source) {
-  const now = Date.now();
-  if (source === 'worker') window.SYNC_METRICS.lastWorker = now;
-  if (source === 'india')  window.SYNC_METRICS.lastIndia  = now;
-  if (source === 'yahoo')  window.SYNC_METRICS.lastYahoo  = now;
-  try { localStorage.setItem('dalal_last_success_' + source, String(now)); } catch(e) {}
-}
-
-function loadLastSuccess() {
-  const w = parseInt(localStorage.getItem('dalal_last_success_worker') || '0', 10);
-  const i = parseInt(localStorage.getItem('dalal_last_success_india') || '0', 10);
-  const y = parseInt(localStorage.getItem('dalal_last_success_yahoo') || '0', 10);
-  if (w) window.SYNC_METRICS.lastWorker = w;
-  if (i) window.SYNC_METRICS.lastIndia  = i;
-  if (y) window.SYNC_METRICS.lastYahoo  = y;
-}
-
-function fmtLastSeen(ts) {
-  if (!ts) return 'Never';
-  return new Date(ts).toLocaleString('en-IN', { timeZone:'Asia/Kolkata', day:'2-digit', month:'short', hour:'2-digit', minute:'2-digit' }) + ' IST';
-}
-
 function loadReqCounters() {
   ['worker', 'indiaApi', 'yahooApi'].forEach(k => {
     const v = parseInt(localStorage.getItem('dalal_req_counter_' + k) || '0', 10);
@@ -2899,7 +2877,7 @@ async function fetchIndianMarket(kind, workerParam) {
     if (!res.ok) return null;
     const data = await res.json();
     INDIA_CACHE[kind] = { ts: Date.now(), data };
-    markSourceSuccess('india');
+    window.SYNC_METRICS.lastIndia = Date.now();
     bumpReqCounter('indiaApi');
     return data;
   } catch(e) {
@@ -2918,7 +2896,7 @@ async function workerFetch(symbols) {
     clearTimeout(timer);
     if (!res.ok) { console.warn('Worker HTTP', res.status); return {}; }
     const data = await res.json();
-    markSourceSuccess('worker');
+    window.SYNC_METRICS.lastWorker = Date.now();
     bumpReqCounter('worker');
     return data;
   } catch(e) {
@@ -3307,7 +3285,6 @@ setInterval(updateClock, 1000);
 
 // Initial load + 5 min auto-refresh
 loadReqCounters();
-loadLastSuccess();
 refreshAllLiveData();
 setInterval(refreshAllLiveData, 5 * 60 * 1000);
 
@@ -3392,7 +3369,7 @@ async function resolveSymbolViaYahoo(query) {
     const res = await fetch(WORKER_URL + '?search=' + encodeURIComponent(clean + ' NSE'));
     if (res.ok) {
       data = await res.json();
-      markSourceSuccess('yahoo');
+      window.SYNC_METRICS.lastYahoo = Date.now();
       bumpReqCounter('worker');
     }
     // Optional direct Yahoo key path (if worker search is unavailable)
@@ -3402,7 +3379,7 @@ async function resolveSymbolViaYahoo(query) {
       });
       if (direct.ok) {
         data = await direct.json();
-        markSourceSuccess('yahoo');
+        window.SYNC_METRICS.lastYahoo = Date.now();
         bumpReqCounter('yahooApi');
       }
     }
@@ -5065,8 +5042,6 @@ function dmdRender(tab) {
   const sync = window.SYNC_METRICS || {};
   const req = sync.requests || { worker:0, indiaApi:0, yahooApi:0 };
   const use = sync.usagePlan || { indiaCap:500, reserve:120, target:380 };
-  const hasIndiaKey = !!(CONFIG.INDIAN_MARKET_API_KEY || localStorage.getItem('dalal_india_api_key'));
-  const hasYahooKey = !!(CONFIG.YAHOO_API_KEY || localStorage.getItem('dalal_yahoo_api_key'));
   const workerOk = !!sync.lastWorker;
   const indiaOk  = !!sync.lastIndia;
   const yahooOk  = !!sync.lastYahoo;
@@ -5077,8 +5052,8 @@ function dmdRender(tab) {
   if (tab === 'sync') {
     const srcRows = [
       { n:'Cloudflare Worker', v: workerOk ? 'ACTIVE' : 'DEGRADED', c: workerOk ? 'var(--green)' : 'var(--red)', d:'Primary quote + breadth proxy (cached)' },
-      { n:'Indian Market API', v: indiaOk ? 'ACTIVE' : (hasIndiaKey ? 'CONFIGURED' : 'NO KEY'), c: indiaOk ? 'var(--green)' : (hasIndiaKey ? '#7C5CFC' : 'var(--red)'), d:'Macro + FII/DII + breadth snapshots (budgeted)' },
-      { n:'Yahoo Finance API', v: yahooOk ? 'ACTIVE' : (hasYahooKey ? 'CONFIGURED' : 'NO KEY'), c: yahooOk ? 'var(--green)' : (hasYahooKey ? 'var(--gold)' : 'var(--red)'), d:'Quote/search reinforcement + CMP fallback' },
+      { n:'Indian Market API', v: indiaOk ? 'ACTIVE' : 'STANDBY', c: indiaOk ? 'var(--green)' : 'var(--gold)', d:'Macro + FII/DII + breadth snapshots (budgeted)' },
+      { n:'Yahoo Finance API', v: yahooOk ? 'ACTIVE' : 'STANDBY', c: yahooOk ? 'var(--green)' : 'var(--gold)', d:'Quote/search reinforcement + CMP fallback' },
     ];
     el.innerHTML = `
       <div class="dmd-section-head">Multi-source confidence</div>
@@ -5095,11 +5070,6 @@ function dmdRender(tab) {
         <span class="dmd-val" style="color:${r.c}">${r.v}</span>
         <span class="dmd-chg" style="color:var(--muted);width:120px">${r.d}</span>
       </div>`).join('')}
-      <div style="padding:8px 12px;border-top:1px solid var(--border);font-family:'JetBrains Mono',monospace;font-size:9px;color:var(--muted);line-height:1.6">
-        Last Worker hit: <span style="color:var(--text)">${fmtLastSeen(sync.lastWorker)}</span><br>
-        Last Indian API hit: <span style="color:${indiaOk?'var(--green)':'#7C5CFC'}">${fmtLastSeen(sync.lastIndia)}</span><br>
-        Last Yahoo hit: <span style="color:${yahooOk?'var(--green)':'var(--gold)'}">${fmtLastSeen(sync.lastYahoo)}</span>
-      </div>
     `;
   } else if (tab === 'freshness') {
     const rows = [
