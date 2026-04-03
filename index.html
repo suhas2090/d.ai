@@ -6741,6 +6741,15 @@ function openGroqModal() {
 }
 function closeGroqModal() { document.getElementById('groqModal').style.display = 'none'; }
 
+async function warmupApiSources() {
+  const tasks = [];
+  if (CONFIG.INDIAN_MARKET_API_KEY) tasks.push(fetchIndianMarket('breadth', 'india_breadth'));
+  if (CONFIG.YAHOO_API_KEY) tasks.push(resolveSymbolViaYahoo('reliance industries'));
+  if (!tasks.length) return;
+  try { await Promise.allSettled(tasks); } catch(e) { /* non-blocking */ }
+  dmdRender(dmdCurrentTab);
+}
+
 function saveGroqKeys() {
   const gk = document.getElementById('groqKeyInput').value.trim();
   const ak = document.getElementById('avKeyInput').value.trim();
@@ -6756,6 +6765,7 @@ function saveGroqKeys() {
   st.style.color = 'var(--green)';
   updateGroqBtn();
   if (ak) fetchAlphaVantageMacro();
+  warmupApiSources();
   setTimeout(closeGroqModal, 1400);
 }
 
@@ -6770,6 +6780,7 @@ function loadGroqKeys() {
   if (yk) CONFIG.YAHOO_API_KEY = yk;
   updateGroqBtn();
   if (ak) setTimeout(fetchAlphaVantageMacro, 3000); // delay so main page loads first
+  setTimeout(warmupApiSources, 1200);
 }
 
 function updateGroqBtn() {
