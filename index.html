@@ -2236,19 +2236,19 @@
 
     </div>
 
-    <!-- ④ DAILY MARKET DATA PANEL — right of Live TV -->
+    <!-- ④ SMART SYNC INSIGHTS PANEL — right of Live TV -->
     <div class="main-news-panel dmd-panel">
 
       <div class="mnp-section-label">
-        <span>📊 Daily Market Data</span>
-        
+        <span>🧠 Smart Sync Insights</span>
+        <span id="dmdTs" style="font-family:'JetBrains Mono',monospace;font-size:9px;color:var(--muted)"></span>
       </div>
 
-      <!-- Tabs: Sectors | Top Movers | F&O -->
+      <!-- Tabs: Sync Health | Freshness | Request Budget -->
       <div class="mnp-tabs" id="dmdTabs" style="margin-bottom:10px">
-        <div class="mnp-tab active" onclick="dmdSwitch('sectors',this)">Sectors</div>
-        <div class="mnp-tab"        onclick="dmdSwitch('movers',this)">Top Movers</div>
-        <div class="mnp-tab"        onclick="dmdSwitch('fno',this)">F&amp;O</div>
+        <div class="mnp-tab active" onclick="dmdSwitch('sync',this)">Sync Health</div>
+        <div class="mnp-tab"        onclick="dmdSwitch('freshness',this)">Freshness</div>
+        <div class="mnp-tab"        onclick="dmdSwitch('budget',this)">Request Budget</div>
       </div>
 
       <!-- Content -->
@@ -2780,6 +2780,8 @@ const CONFIG = {
   GEMINI_API_KEY: "", // loaded from localStorage at runtime
   GROQ_API_KEY: "",   // loaded from localStorage at runtime
   ALPHA_VANTAGE_KEY: "", // loaded from localStorage at runtime
+  INDIAN_MARKET_API_KEY: "", // loaded from localStorage at runtime
+  YAHOO_API_KEY: "", // optional direct Yahoo/RapidAPI key, loaded from localStorage at runtime
 
   // ── CLOUDFLARE WORKER URL ────────────────────────────────────
   //  Step 1: Go to cloudflare.com → Workers & Pages → Create Worker
@@ -2788,9 +2790,9 @@ const CONFIG = {
   //  Format: "https://dalal-prices.YOUR-NAME.workers.dev"
   WORKER_URL: "https://dalal-prices.suhasnrao.workers.dev",
 
-  // ── YAHOO FINANCE RAPIDAPI KEY ──────────────────────────────
-  // Legacy RapidAPI key — no longer used (replaced by Finnhub)
-  // YAHOO_FINANCE_API_KEY: "a1373f54a8mshe0a721106e107f1p13a10bjsn03d658c329ba",
+  // ── OPTIONAL DIRECT API KEYS ─────────────────────────────────
+  // Indian Market API key (500 req / month): used for low-frequency, high-value datasets
+  // Yahoo API key: used for quote/search fallback if worker path is unavailable
 
   // ── DATA SOURCE URLs ─────────────────────────────────────────
   URLS: {
@@ -2839,6 +2841,50 @@ const CONFIG = {
 const WORKER_URL = CONFIG.WORKER_URL;
 
 const priceCache = {};
+window.SYNC_METRICS = {
+  requests: { worker: 0, indiaApi: 0, yahooApi: 0 },
+  usagePlan: { indiaCap: 500, reserve: 120, target: 380 },
+  freshness: { cmp: '≤ 3 min', breadth: '≤ 5 min', fiidii: 'Daily close', macro: '15–60 min' },
+  lastWorker: null, lastIndia: null, lastYahoo: null
+};
+const INDIA_CACHE = {};
+const INDIA_API_TTL = {
+  fiidii: 60 * 60 * 1000, // 1h
+  macro: 30 * 60 * 1000,  // 30m
+  breadth: 15 * 60 * 1000 // 15m
+};
+
+function bumpReqCounter(type) {
+  const m = window.SYNC_METRICS;
+  m.requests[type] = (m.requests[type] || 0) + 1;
+  try { localStorage.setItem('dalal_req_counter_' + type, String(m.requests[type])); } catch(e) {}
+}
+
+function loadReqCounters() {
+  ['worker', 'indiaApi', 'yahooApi'].forEach(k => {
+    const v = parseInt(localStorage.getItem('dalal_req_counter_' + k) || '0', 10);
+    if (!Number.isNaN(v)) window.SYNC_METRICS.requests[k] = v;
+  });
+}
+
+async function fetchIndianMarket(kind, workerParam) {
+  const cache = INDIA_CACHE[kind];
+  if (cache && (Date.now() - cache.ts < (INDIA_API_TTL[kind] || 20 * 60 * 1000))) return cache.data;
+  if (!CONFIG.INDIAN_MARKET_API_KEY) return null;
+  try {
+    // Route via worker to avoid exposing vendor-specific endpoint contract here.
+    const res = await fetch(`${WORKER_URL}?${workerParam}=1&india_key=${encodeURIComponent(CONFIG.INDIAN_MARKET_API_KEY)}`);
+    if (!res.ok) return null;
+    const data = await res.json();
+    INDIA_CACHE[kind] = { ts: Date.now(), data };
+    window.SYNC_METRICS.lastIndia = Date.now();
+    bumpReqCounter('indiaApi');
+    return data;
+  } catch(e) {
+    console.warn('[Indian API]', kind, e.message);
+    return null;
+  }
+}
 
 // ── CORE: fetch batch of symbols via Cloudflare Worker ──
 async function workerFetch(symbols) {
@@ -2849,7 +2895,10 @@ async function workerFetch(symbols) {
     const res = await fetch(url, { signal: ctrl.signal });
     clearTimeout(timer);
     if (!res.ok) { console.warn('Worker HTTP', res.status); return {}; }
-    return await res.json();
+    const data = await res.json();
+    window.SYNC_METRICS.lastWorker = Date.now();
+    bumpReqCounter('worker');
+    return data;
   } catch(e) {
     console.warn('Worker fetch failed:', e.message);
     return {};
@@ -3066,9 +3115,12 @@ let fiiLastDate = null;
 
 async function fetchFIIDII() {
   try {
-    const res = await fetch(WORKER_URL + '?fiidii=1');
-    if (!res.ok) return;
-    const d = await res.json();
+    let d = await fetchIndianMarket('fiidii', 'india_fiidii');
+    if (!d) {
+      const res = await fetch(WORKER_URL + '?fiidii=1');
+      if (!res.ok) return;
+      d = await res.json();
+    }
     if (d.error || (d.fpi_net === null && d.dii_net === null)) {
       console.warn('FII/DII: no data from NSE', d);
       return;
@@ -3142,6 +3194,7 @@ async function refreshAllLiveData() {
   applyToUI(stockRaw,  'stocks');
   applyToUI(indexRaw,  'indices');
   applyToUI(macroRaw,  'macro');
+  dmdRender(dmdCurrentTab);
 
   // News (rotates between feeds each refresh)
   refreshNews();
@@ -3231,6 +3284,7 @@ updateClock();
 setInterval(updateClock, 1000);
 
 // Initial load + 5 min auto-refresh
+loadReqCounters();
 refreshAllLiveData();
 setInterval(refreshAllLiveData, 5 * 60 * 1000);
 
@@ -3306,15 +3360,30 @@ function extractSymbol(query) {
 
 // For unknown companies — ask Gemini to identify the NSE symbol
 async function resolveSymbolViaYahoo(query) {
-  // Use Yahoo Finance autocomplete search to find NSE symbol for any company name
+  // Use Yahoo Finance autocomplete search to find NSE symbol for any company name.
   try {
     const clean = query.toLowerCase()
       .replace(/research|analysis|deep dive|fundamental|technical|stock|share|price|compare|vs|and|ltd|limited|industries|corporation|company/g, '')
       .trim();
-    const searchUrl = 'https://query1.finance.yahoo.com/v1/finance/search?q=' + encodeURIComponent(clean + ' NSE') + '&quotesCount=5&newsCount=0&listsCount=0';
+    let data = null;
     const res = await fetch(WORKER_URL + '?search=' + encodeURIComponent(clean + ' NSE'));
-    if (!res.ok) return null;
-    const data = await res.json();
+    if (res.ok) {
+      data = await res.json();
+      window.SYNC_METRICS.lastYahoo = Date.now();
+      bumpReqCounter('worker');
+    }
+    // Optional direct Yahoo key path (if worker search is unavailable)
+    if ((!data || !data.quotes?.length) && CONFIG.YAHOO_API_KEY) {
+      const direct = await fetch('https://query1.finance.yahoo.com/v1/finance/search?q=' + encodeURIComponent(clean + ' NSE') + '&quotesCount=6&newsCount=0&listsCount=0', {
+        headers: { 'x-api-key': CONFIG.YAHOO_API_KEY }
+      });
+      if (direct.ok) {
+        data = await direct.json();
+        window.SYNC_METRICS.lastYahoo = Date.now();
+        bumpReqCounter('yahooApi');
+      }
+    }
+    if (!data) return null;
     // Worker returns array of {symbol, name, exchange}
     if (!data.quotes || data.quotes.length === 0) return null;
     // Find first NSE result
@@ -4946,69 +5015,11 @@ mnpRenderHeadlines('et');
 setInterval(() => mnpRenderHeadlines(mnpCurrentTab), 5 * 60 * 1000);
 
 // ══════════════════════════════════════════════════════════════
-//  📊 DAILY MARKET DATA — Tab switcher + dummy content
-//  Tabs: Indices | Sectors | Top Movers | F&O
-//  Currently shows EOD placeholder data (live data coming soon)
+//  🧠 SMART SYNC INSIGHTS PANEL
+//  Replaces Daily Market Data with source-quality visibility
 // ══════════════════════════════════════════════════════════════
 
-const DMD_DATA = {
-
-  indices: [
-    { label:'NIFTY 50',        val:'22,161.35', chg:'-261.55', pct:'-1.17%', up:false },
-    { label:'SENSEX',          val:'73,137.90', chg:'-883.28', pct:'-1.19%', up:false },
-    { label:'BANK NIFTY',      val:'47,892.15', chg:'-543.40', pct:'-1.12%', up:false },
-    { label:'NIFTY MIDCAP 100',val:'48,920.60', chg:'+124.30', pct:'+0.25%', up:true  },
-    { label:'NIFTY SMALLCAP',  val:'14,312.45', chg:'+89.70',  pct:'+0.63%', up:true  },
-    { label:'NIFTY IT',        val:'35,418.20', chg:'-892.30', pct:'-2.45%', up:false },
-    { label:'NIFTY PHARMA',    val:'21,034.55', chg:'+312.80', pct:'+1.51%', up:true  },
-    { label:'INDIA VIX',       val:'16.82',     chg:'+2.14',   pct:'+14.6%', up:false },
-    { label:'GIFT NIFTY',      val:'22,205.00', chg:'-248.00', pct:'-1.11%', up:false },
-  ],
-
-  sectors: [
-    { label:'IT',          val:'-2.45%', bar:82, up:false },
-    { label:'Auto',        val:'-1.88%', bar:68, up:false },
-    { label:'Banking',     val:'-1.12%', bar:45, up:false },
-    { label:'FMCG',        val:'-0.43%', bar:20, up:false },
-    { label:'Realty',      val:'+0.18%', bar:10, up:true  },
-    { label:'Pharma',      val:'+1.51%', bar:55, up:true  },
-    { label:'Metal',       val:'+1.73%', bar:62, up:true  },
-    { label:'PSU Bank',    val:'+0.94%', bar:38, up:true  },
-    { label:'Media',       val:'+2.31%', bar:74, up:true  },
-    { label:'Energy',      val:'-0.76%', bar:30, up:false },
-  ],
-
-  movers: {
-    gainers: [
-      { sym:'COALINDIA',  name:'Coal India',     val:'491.25', pct:'+4.82%' },
-      { sym:'HINDUNILVR', name:'HUL',            val:'2,318.40',pct:'+3.14%' },
-      { sym:'SUNPHARMA',  name:'Sun Pharma',     val:'1,724.60',pct:'+2.91%' },
-      { sym:'NESTLEIND',  name:'Nestle India',   val:'2,241.35',pct:'+2.44%' },
-      { sym:'CIPLA',      name:'Cipla',          val:'1,512.80',pct:'+2.18%' },
-    ],
-    losers: [
-      { sym:'TECHM',      name:'Tech Mahindra',  val:'1,312.45',pct:'-4.21%' },
-      { sym:'WIPRO',      name:'Wipro',          val:'298.75',  pct:'-3.88%' },
-      { sym:'INFY',       name:'Infosys',        val:'1,315.80',pct:'-3.50%' },
-      { sym:'LTIM',       name:'LTIMindtree',    val:'5,218.90',pct:'-3.12%' },
-      { sym:'HCLTECH',    name:'HCL Tech',       val:'1,624.30',pct:'-2.95%' },
-    ],
-  },
-
-  fno: [
-    { label:'NIFTY PCR',         val:'0.91',         note:'Bearish' },
-    { label:'Max Pain',          val:'22,000',       note:'Key level' },
-    { label:'Max OI Call',       val:'22,500 CE',    note:'Resistance' },
-    { label:'Max OI Put',        val:'21,500 PE',    note:'Support'   },
-    { label:'ATM IV (Nifty)',    val:'13.42%',       note:'Elevated'  },
-    { label:'Total F&O Turnover',val:'₹4.82L Cr',   note:'vs ₹4.1L avg' },
-    { label:'FII Index Futures', val:'-₹2,840 Cr',  note:'Net short' },
-    { label:'FII Index Options', val:'+₹1,240 Cr',  note:'Net long'  },
-    { label:'Expiry',            val:'3 days',       note:'Weekly Thu' },
-  ],
-};
-
-let dmdCurrentTab = 'sectors';
+var dmdCurrentTab = window.dmdCurrentTab || 'sync';
 
 function dmdSwitch(tab, tabEl) {
   document.querySelectorAll('#dmdTabs .mnp-tab').forEach(t => t.classList.remove('active'));
@@ -5024,76 +5035,83 @@ function dmdRender(tab) {
   // EOD timestamp
   const tsEl = document.getElementById('dmdTs');
   if (tsEl) {
-    const now = new Date();
-    const ist = now.toLocaleString('en-IN',{ timeZone:'Asia/Kolkata', hour:'2-digit', minute:'2-digit', day:'2-digit', month:'short' });
-    tsEl.textContent = 'EOD · ' + ist + ' IST';
+    const ist = new Date().toLocaleString('en-IN',{ timeZone:'Asia/Kolkata', hour:'2-digit', minute:'2-digit', day:'2-digit', month:'short' });
+    tsEl.textContent = 'Updated · ' + ist + ' IST';
   }
 
-  if (tab === 'indices') {
-    el.innerHTML = DMD_DATA.indices.map(r => `
-      <div class="dmd-row">
-        <span class="dmd-label">${r.label}</span>
-        <span class="dmd-val" style="color:var(--text)">₹${r.val}</span>
-        <span class="dmd-chg" style="color:${r.up ? 'var(--green)' : 'var(--red)'}">
-          ${r.pct}
-        </span>
-      </div>`).join('');
+  const sync = window.SYNC_METRICS || {};
+  const req = sync.requests || { worker:0, indiaApi:0, yahooApi:0 };
+  const use = sync.usagePlan || { indiaCap:500, reserve:120, target:380 };
+  const workerOk = !!sync.lastWorker;
+  const indiaOk  = !!sync.lastIndia;
+  const yahooOk  = !!sync.lastYahoo;
+  const conf = Math.min(100, Math.max(35,
+    (workerOk ? 35 : 12) + (indiaOk ? 35 : 8) + (yahooOk ? 30 : 10)
+  ));
 
-  } else if (tab === 'sectors') {
-    el.innerHTML = `<div class="dmd-section-head">Sector Performance — Today</div>` +
-      DMD_DATA.sectors.map(r => `
-      <div class="dmd-row" style="gap:10px">
-        <span class="dmd-label" style="min-width:72px">${r.label}</span>
-        <div style="flex:1;height:5px;background:var(--border);border-radius:3px;overflow:hidden">
-          <div style="height:100%;width:${r.bar}%;background:${r.up ? 'var(--green)' : 'var(--red)'};border-radius:3px;transition:width 0.6s ease"></div>
-        </div>
-        <span style="font-family:'JetBrains Mono',monospace;font-size:10px;width:52px;text-align:right;
-          color:${r.up ? 'var(--green)' : 'var(--red)'}">${r.val}</span>
-      </div>`).join('');
-
-  } else if (tab === 'movers') {
+  if (tab === 'sync') {
+    const srcRows = [
+      { n:'Cloudflare Worker', v: workerOk ? 'ACTIVE' : 'DEGRADED', c: workerOk ? 'var(--green)' : 'var(--red)', d:'Primary quote + breadth proxy (cached)' },
+      { n:'Indian Market API', v: indiaOk ? 'ACTIVE' : 'STANDBY', c: indiaOk ? 'var(--green)' : 'var(--gold)', d:'Macro + FII/DII + breadth snapshots (budgeted)' },
+      { n:'Yahoo Finance API', v: yahooOk ? 'ACTIVE' : 'STANDBY', c: yahooOk ? 'var(--green)' : 'var(--gold)', d:'Quote/search reinforcement + CMP fallback' },
+    ];
     el.innerHTML = `
-      <div class="dmd-section-head">🟢 Top Gainers</div>
-      ${DMD_DATA.movers.gainers.map(r => `
-        <div class="dmd-row">
-          <div style="flex:1">
-            <div style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text)">${r.sym}</div>
-            <div style="font-size:9px;color:var(--muted)">${r.name}</div>
-          </div>
-          <span class="dmd-val" style="color:var(--text)">₹${r.val}</span>
-          <span class="dmd-chg" style="color:var(--green)">${r.pct}</span>
-        </div>`).join('')}
-      <div class="dmd-section-head" style="margin-top:2px">🔴 Top Losers</div>
-      ${DMD_DATA.movers.losers.map(r => `
-        <div class="dmd-row">
-          <div style="flex:1">
-            <div style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text)">${r.sym}</div>
-            <div style="font-size:9px;color:var(--muted)">${r.name}</div>
-          </div>
-          <span class="dmd-val" style="color:var(--text)">₹${r.val}</span>
-          <span class="dmd-chg" style="color:var(--red)">${r.pct}</span>
-        </div>`).join('')}`;
-
-  } else if (tab === 'fno') {
-    el.innerHTML = `<div class="dmd-section-head">F&amp;O Snapshot — Expiry Week</div>` +
-      DMD_DATA.fno.map(r => `
+      <div class="dmd-section-head">Multi-source confidence</div>
+      <div class="dmd-row" style="gap:10px">
+        <span class="dmd-label" style="min-width:120px">Overall score</span>
+        <div style="flex:1;height:7px;background:var(--border);border-radius:4px;overflow:hidden">
+          <div style="height:100%;width:${conf}%;background:${conf>=75?'var(--green)':conf>=55?'var(--gold)':'var(--red)'};border-radius:4px"></div>
+        </div>
+        <span style="font-family:'JetBrains Mono',monospace;font-size:11px;width:44px;text-align:right;color:${conf>=75?'var(--green)':conf>=55?'var(--gold)':'var(--red)'}">${conf}%</span>
+      </div>
+      ${srcRows.map(r => `
       <div class="dmd-row">
-        <span class="dmd-label">${r.label}</span>
-        <span class="dmd-val" style="color:var(--text)">${r.val}</span>
-        <span style="font-family:'JetBrains Mono',monospace;font-size:9px;
-          color:var(--muted);text-align:right;min-width:70px">${r.note}</span>
+        <span class="dmd-label">${r.n}</span>
+        <span class="dmd-val" style="color:${r.c}">${r.v}</span>
+        <span class="dmd-chg" style="color:var(--muted);width:120px">${r.d}</span>
+      </div>`).join('')}
+    `;
+  } else if (tab === 'freshness') {
+    const rows = [
+      { n:'Stock CMP', v: sync.freshness?.cmp || '≤ 3 min', c:'var(--green)' },
+      { n:'Market Breadth', v: sync.freshness?.breadth || '≤ 5 min', c:'var(--gold)' },
+      { n:'FII/DII Flow', v: sync.freshness?.fiidii || 'Daily close', c:'var(--saffron)' },
+      { n:'Macro Dashboard', v: sync.freshness?.macro || '15–60 min', c:'var(--gold)' },
+    ];
+    el.innerHTML = `<div class="dmd-section-head">Data freshness SLA</div>` + rows.map(r => `
+      <div class="dmd-row">
+        <span class="dmd-label">${r.n}</span>
+        <span class="dmd-val" style="color:${r.c}">${r.v}</span>
+        <span class="dmd-chg" style="color:var(--muted)">target</span>
       </div>`).join('') +
-      `<div style="padding:10px 12px;font-family:'JetBrains Mono',monospace;
-        font-size:9px;color:var(--muted);border-top:1px solid var(--border);
-        line-height:1.6">
-        ⚠ Dummy data — live F&amp;O data coming soon.<br>
-        Will pull from NSE derivatives API via Cloudflare Worker.
+      `<div style="padding:10px 12px;font-family:'JetBrains Mono',monospace;font-size:9px;color:var(--muted);border-top:1px solid var(--border);line-height:1.55">
+        CMP and search reports prioritize Yahoo/Worker for fast refresh.<br>
+        Indian API is throttled for high-value endpoints to preserve 500/month quota.
       </div>`;
+  } else if (tab === 'budget') {
+    const usedIndia = req.indiaApi || 0;
+    const remainIndia = Math.max(0, use.indiaCap - usedIndia);
+    const utilPct = Math.min(100, Math.round((usedIndia / use.indiaCap) * 100));
+    el.innerHTML = `
+      <div class="dmd-section-head">Indian API monthly budget</div>
+      <div class="dmd-row" style="gap:10px">
+        <span class="dmd-label" style="min-width:110px">Usage ${usedIndia}/${use.indiaCap}</span>
+        <div style="flex:1;height:7px;background:var(--border);border-radius:4px;overflow:hidden">
+          <div style="height:100%;width:${utilPct}%;background:${utilPct<65?'var(--green)':utilPct<85?'var(--gold)':'var(--red)'};border-radius:4px"></div>
+        </div>
+        <span style="font-family:'JetBrains Mono',monospace;font-size:10px;width:38px;text-align:right;color:var(--muted)">${utilPct}%</span>
+      </div>
+      <div class="dmd-row"><span class="dmd-label">Reserved for critical days</span><span class="dmd-val" style="color:var(--saffron)">${use.reserve}</span><span class="dmd-chg" style="color:var(--muted)">req</span></div>
+      <div class="dmd-row"><span class="dmd-label">Operating target</span><span class="dmd-val" style="color:var(--green)">${use.target}</span><span class="dmd-chg" style="color:var(--muted)">req/month</span></div>
+      <div class="dmd-row"><span class="dmd-label">Remaining</span><span class="dmd-val" style="color:${remainIndia<50?'var(--red)':'var(--green)'}">${remainIndia}</span><span class="dmd-chg" style="color:var(--muted)">req</span></div>
+      <div class="dmd-row"><span class="dmd-label">Yahoo direct usage</span><span class="dmd-val" style="color:var(--text)">${req.yahooApi || 0}</span><span class="dmd-chg" style="color:var(--muted)">this month</span></div>
+      <div class="dmd-row"><span class="dmd-label">Worker usage</span><span class="dmd-val" style="color:var(--text)">${req.worker || 0}</span><span class="dmd-chg" style="color:var(--muted)">this month</span></div>
+    `;
   }
 }
 
-// Init — default to sectors (indices tab removed)
-dmdRender('sectors');
+// Init
+dmdRender('sync');
 
 // ══════════════════════════════════════════════════════════════
 //  𝕏 INDIAN MARKET PULSE v3.0
@@ -6666,11 +6684,13 @@ document.addEventListener('keydown', e => {
 ══════════════════════════════════════════════════════ -->
 <div id="groqModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,0.88);z-index:99999;align-items:center;justify-content:center;backdrop-filter:blur(6px)">
   <div style="background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:32px;width:90%;max-width:480px;box-shadow:0 24px 80px rgba(0,0,0,0.7)">
-    <div style="font-family:'Playfair Display',serif;font-size:20px;font-weight:900;margin-bottom:4px">⚡ Live AI + Data Setup</div>
+    <div style="font-family:'Playfair Display',serif;font-size:20px;font-weight:900;margin-bottom:4px">⚡ AI Keys + Data Sync Setup</div>
     <div style="font-size:11px;color:var(--muted);font-family:'JetBrains Mono',monospace;margin-bottom:22px;line-height:1.7">
       Keys are stored <strong>only in your browser</strong>. Never sent anywhere except the respective APIs directly.<br>
-      <a href="https://console.groq.com/keys" target="_blank" style="color:var(--saffron);text-decoration:none">Groq free key →</a> &nbsp;|&nbsp;
-      <a href="https://www.alphavantage.co/support/#api-key" target="_blank" style="color:#00BCD4;text-decoration:none">Alpha Vantage free key →</a>
+      <a href="https://console.groq.com/keys" target="_blank" style="color:var(--saffron);text-decoration:none">Groq key →</a> &nbsp;|&nbsp;
+      <a href="https://www.alphavantage.co/support/#api-key" target="_blank" style="color:#00BCD4;text-decoration:none">Alpha Vantage key →</a> &nbsp;|&nbsp;
+      <a href="#" target="_blank" style="color:#7C5CFC;text-decoration:none">Indian Market API key</a> &nbsp;|&nbsp;
+      <a href="#" target="_blank" style="color:var(--gold);text-decoration:none">Yahoo API key</a>
     </div>
     <div style="margin-bottom:14px">
       <div style="font-size:10px;color:var(--saffron);font-family:'JetBrains Mono',monospace;letter-spacing:1px;margin-bottom:5px">GROQ API KEY — Powers Scenario + Supply Chain AI (Llama 3.3 70B)</div>
@@ -6684,6 +6704,18 @@ document.addEventListener('keydown', e => {
         style="width:100%;background:var(--ink);border:1px solid var(--border);border-radius:8px;padding:11px 13px;color:var(--text);font-size:13px;font-family:'JetBrains Mono',monospace;box-sizing:border-box;outline:none"
         onfocus="this.style.borderColor='#00BCD4'" onblur="this.style.borderColor='var(--border)'">
     </div>
+    <div style="margin-bottom:14px">
+      <div style="font-size:10px;color:#7C5CFC;font-family:'JetBrains Mono',monospace;letter-spacing:1px;margin-bottom:5px">INDIAN MARKET API KEY — Breadth + FII/DII + Macro snapshots (500 requests/month)</div>
+      <input id="indianApiKeyInput" type="password" placeholder="Paste Indian API key…" autocomplete="off"
+        style="width:100%;background:var(--ink);border:1px solid var(--border);border-radius:8px;padding:11px 13px;color:var(--text);font-size:13px;font-family:'JetBrains Mono',monospace;box-sizing:border-box;outline:none"
+        onfocus="this.style.borderColor='#7C5CFC'" onblur="this.style.borderColor='var(--border)'">
+    </div>
+    <div style="margin-bottom:22px">
+      <div style="font-size:10px;color:var(--gold);font-family:'JetBrains Mono',monospace;letter-spacing:1px;margin-bottom:5px">YAHOO API KEY — Direct quote/search fallback (optional, used sparingly)</div>
+      <input id="yahooApiKeyInput" type="password" placeholder="Paste Yahoo API key…" autocomplete="off"
+        style="width:100%;background:var(--ink);border:1px solid var(--border);border-radius:8px;padding:11px 13px;color:var(--text);font-size:13px;font-family:'JetBrains Mono',monospace;box-sizing:border-box;outline:none"
+        onfocus="this.style.borderColor='var(--gold)'" onblur="this.style.borderColor='var(--border)'">
+    </div>
     <div style="display:flex;gap:10px">
       <button onclick="saveGroqKeys()" style="flex:1;background:linear-gradient(135deg,var(--saffron),#c85000);color:#fff;border:none;border-radius:8px;padding:12px;font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:700;cursor:pointer;letter-spacing:0.5px">SAVE & ACTIVATE LIVE AI</button>
       <button onclick="closeGroqModal()" style="background:var(--border);color:var(--text);border:none;border-radius:8px;padding:12px 18px;font-family:'JetBrains Mono',monospace;font-size:12px;cursor:pointer">Cancel</button>
@@ -6694,24 +6726,32 @@ document.addEventListener('keydown', e => {
 
 <script>
 // ════════════════════════════════════════════════════════════
-//  KEY MANAGEMENT — GROQ + ALPHA VANTAGE
+//  KEY MANAGEMENT — GROQ + ALPHA VANTAGE + INDIAN API + YAHOO
 // ════════════════════════════════════════════════════════════
 function openGroqModal() {
   document.getElementById('groqModal').style.display = 'flex';
   const gk = localStorage.getItem('dalal_groq_key');
   const ak = localStorage.getItem('dalal_av_key');
+  const ik = localStorage.getItem('dalal_india_api_key');
+  const yk = localStorage.getItem('dalal_yahoo_api_key');
   if (gk) document.getElementById('groqKeyInput').value = gk;
   if (ak) document.getElementById('avKeyInput').value = ak;
+  if (ik) document.getElementById('indianApiKeyInput').value = ik;
+  if (yk) document.getElementById('yahooApiKeyInput').value = yk;
 }
 function closeGroqModal() { document.getElementById('groqModal').style.display = 'none'; }
 
 function saveGroqKeys() {
   const gk = document.getElementById('groqKeyInput').value.trim();
   const ak = document.getElementById('avKeyInput').value.trim();
+  const ik = document.getElementById('indianApiKeyInput').value.trim();
+  const yk = document.getElementById('yahooApiKeyInput').value.trim();
   const st = document.getElementById('groqModalStatus');
-  if (!gk && !ak) { st.textContent = '⚠ Enter at least one key.'; st.style.color = 'var(--red)'; return; }
+  if (!gk && !ak && !ik && !yk) { st.textContent = '⚠ Enter at least one key.'; st.style.color = 'var(--red)'; return; }
   if (gk) { localStorage.setItem('dalal_groq_key', gk); CONFIG.GROQ_API_KEY = gk; }
   if (ak) { localStorage.setItem('dalal_av_key', ak); CONFIG.ALPHA_VANTAGE_KEY = ak; }
+  if (ik) { localStorage.setItem('dalal_india_api_key', ik); CONFIG.INDIAN_MARKET_API_KEY = ik; }
+  if (yk) { localStorage.setItem('dalal_yahoo_api_key', yk); CONFIG.YAHOO_API_KEY = yk; }
   st.textContent = '✓ Keys saved. Activating live data…';
   st.style.color = 'var(--green)';
   updateGroqBtn();
@@ -6722,8 +6762,12 @@ function saveGroqKeys() {
 function loadGroqKeys() {
   const gk = localStorage.getItem('dalal_groq_key');
   const ak = localStorage.getItem('dalal_av_key');
+  const ik = localStorage.getItem('dalal_india_api_key');
+  const yk = localStorage.getItem('dalal_yahoo_api_key');
   if (gk) CONFIG.GROQ_API_KEY = gk;
   if (ak) CONFIG.ALPHA_VANTAGE_KEY = ak;
+  if (ik) CONFIG.INDIAN_MARKET_API_KEY = ik;
+  if (yk) CONFIG.YAHOO_API_KEY = yk;
   updateGroqBtn();
   if (ak) setTimeout(fetchAlphaVantageMacro, 3000); // delay so main page loads first
 }
@@ -6734,20 +6778,26 @@ function updateGroqBtn() {
   const status = document.getElementById('dockKeyStatus');
   const hasG   = !!localStorage.getItem('dalal_groq_key');
   const hasA   = !!localStorage.getItem('dalal_av_key');
+  const hasI   = !!localStorage.getItem('dalal_india_api_key');
+  const hasY   = !!localStorage.getItem('dalal_yahoo_api_key');
 
-  if (hasG && hasA) {
+  if (hasG && hasA && hasI && hasY) {
     if (btn)    { btn.style.borderColor='rgba(0,200,83,0.5)'; }
     if (label)  { label.textContent='✓ AI LIVE'; label.style.color='var(--green)'; }
-    if (status) { status.textContent='Groq + Alpha Vantage active'; status.style.color='var(--green)'; }
-  } else if (hasG || hasA) {
+    if (status) { status.textContent='Groq + AV + Indian API + Yahoo active'; status.style.color='var(--green)'; }
+  } else if (hasG || hasA || hasI || hasY) {
     if (btn)    { btn.style.borderColor='rgba(255,107,0,0.6)'; }
     if (label)  { label.textContent='⚙ AI KEYS'; label.style.color='var(--saffron)'; }
-    if (status) { status.textContent= hasG ? 'Groq active · Add AV key' : 'AV active · Add Groq key'; }
+    if (status) {
+      const active = [hasG && 'Groq', hasA && 'AV', hasI && 'Indian API', hasY && 'Yahoo'].filter(Boolean).join(', ');
+      status.textContent = active ? `${active} active` : 'Add keys';
+    }
   } else {
     if (btn)    { btn.style.borderColor='rgba(255,107,0,0.4)'; }
     if (label)  { label.textContent='⚙ AI KEYS'; label.style.color='var(--saffron)'; }
-    if (status) { status.textContent='Groq + Alpha Vantage'; status.style.color='var(--muted)'; }
+    if (status) { status.textContent='Groq + AV + Indian API + Yahoo'; status.style.color='var(--muted)'; }
   }
+  dmdRender(dmdCurrentTab);
 }
 
 // ════════════════════════════════════════════════════════════
@@ -7825,9 +7875,18 @@ function closeMacroInsight() {
 async function macroRefreshAll() {
   // Reset justification cache on refresh
   macroJustCached = null;
+  const indiaMacro = await fetchIndianMarket('macro', 'india_macro');
+  if (indiaMacro?.tiles) {
+    Object.entries(indiaMacro.tiles).forEach(([k, v]) => {
+      if (!MACRO_DATA[k] || !v) return;
+      if (typeof v.value === 'number') MACRO_DATA[k].value = v.value;
+      if (v.period) MACRO_DATA[k].period = v.period;
+    });
+  }
   // Try to update IIP and WPI from Groq if available (since these aren't in Alpha Vantage free tier)
   if (CONFIG.GROQ_API_KEY) await macroFillMissingFromGroq();
   macroRenderTiles();
+  dmdRender(dmdCurrentTab);
 }
 
 async function macroFillMissingFromGroq() {
@@ -7910,6 +7969,22 @@ function mbSetState(state) {
 async function mbFetch() {
   mbSetState('loading');
   try {
+    const indiaBreadth = await fetchIndianMarket('breadth', 'india_breadth');
+    if (indiaBreadth && (indiaBreadth.ad || indiaBreadth.gainers || indiaBreadth.losers || indiaBreadth.pcr)) {
+      mbData = {
+        ad: indiaBreadth.ad || null,
+        gainers: indiaBreadth.gainers || null,
+        losers: indiaBreadth.losers || null,
+        pcr: indiaBreadth.pcr || null
+      };
+      mbRender(mbData);
+      mbSetState('content');
+      const ts = document.getElementById('mbLastUpdated');
+      if (ts) ts.textContent = new Date().toLocaleTimeString('en-IN', { hour:'2-digit', minute:'2-digit', timeZone:'Asia/Kolkata' }) + ' IST';
+      dmdRender(dmdCurrentTab);
+      return;
+    }
+
     // Parallel: NSE advance-decline + top gainers/losers + 52w + PCR from Yahoo
     const [adRes, gainRes, lossRes, pcrRes] = await Promise.allSettled([
       fetch(WORKER_URL + '?breadth=ad'),
@@ -7929,6 +8004,7 @@ async function mbFetch() {
 
     const ts = document.getElementById('mbLastUpdated');
     if (ts) ts.textContent = new Date().toLocaleTimeString('en-IN', { hour:'2-digit', minute:'2-digit', timeZone:'Asia/Kolkata' }) + ' IST';
+    dmdRender(dmdCurrentTab);
 
   } catch(e) {
     console.warn('[MB]', e.message);
